@@ -21,8 +21,9 @@
 #
 # 说明：
 # - 装好后用「<名称> <子命令>」管理，例如 tun-server restart / tun-server logs。
-# - 调日志级别：「<名称> loglevel debug」运行期改并重启；不带参数则查看当前级别。
-#   级别通过 systemd drop-in 的 LOG_LEVEL 环境变量生效，update 重装后保留。
+# - 调日志级别：「<名称> loglevel debug」运行期热更新（发 SIGHUP，不重启）；不带
+#   参数则查看当前级别。级别存于 BIN_DIR/loglevel 文件，进程启动读它、收 SIGHUP
+#   重读；update 重装后保留，uninstall 随目录删除。
 # - 二进制无本地配置：启动后用公网 IP 登录 heihaweb（dash.heiha.vip）拉全部配置，
 #   未注册 IP 会被拒绝。TLS cert/key 文件由运维按 heihaweb 下发路径预置；本脚本
 #   只装二进制与服务，不处理证书。
@@ -83,6 +84,8 @@ WRAPPER="/usr/local/bin/${NAME}"          # 同名管理命令（进 PATH）
 SERVICE_NAME="${NAME}"
 SERVICE_PATH="/etc/systemd/system/${NAME}.service"
 VERSION_FILE="${BIN_DIR}/.version"
+LEVEL_FILE="${BIN_DIR}/loglevel"          # 日志级别文件；unit 用 LOG_LEVEL_FILE 指向它，
+                                          # 进程启动读一次、收到 SIGHUP 再热更新（不重启）
 
 err() { echo "ERROR: $*" >&2; exit 1; }
 [ "$(id -u)" = "0" ] || err "请用 root 运行（sudo）"
@@ -149,6 +152,8 @@ ExecStart=${BIN_PATH}
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+# 日志级别文件：进程启动读它、收到 SIGHUP 再热更新（见「<名称> loglevel」）
+Environment=LOG_LEVEL_FILE=${LEVEL_FILE}
 # 监听 :443 需特权端口，且需读取 heihaweb 下发路径的 cert/key
 User=root
 
@@ -156,14 +161,29 @@ User=root
 WantedBy=multi-user.target
 UNIT
 
-# ---- 可选：按 --log-level 写 systemd drop-in（覆盖 LOG_LEVEL 环境变量）----
-# drop-in 独立于主 unit：update 重装会重写主 unit 但保留这里设的级别；运行期亦可
-# 用「<名称> loglevel <级别>」修改。未指定 --log-level 时不创建（保留既有/默认）。
+# ---- 可选：按 --log-level 写日志级别文件 ----
+# 级别文件是唯一来源：进程启动读它，运行期用「<名称> loglevel <级别>」改并发 SIGHUP
+# 热更新（不重启）。文件在 BIN_DIR 内，update 重装保留、uninstall 随目录删除。
+# 未指定 --log-level 时不写（进程回退到 info；若旧版遗留 LOG_LEVEL 环境变量则用它）。
 if [ -n "${LOG_LEVEL}" ]; then
-  echo "==> 设置日志级别 LOG_LEVEL=${LOG_LEVEL}（systemd drop-in）"
-  mkdir -p "${SERVICE_PATH}.d"
-  printf '[Service]\nEnvironment=LOG_LEVEL=%s\n' "${LOG_LEVEL}" > "${SERVICE_PATH}.d/loglevel.conf"
+  echo "==> 设置日志级别 ${LOG_LEVEL}（写入 ${LEVEL_FILE}）"
+  mkdir -p "${BIN_DIR}"
+  printf '%s\n' "${LOG_LEVEL}" > "${LEVEL_FILE}"
 fi
+
+# ---- 迁移旧版 drop-in（Environment=LOG_LEVEL=…）到级别文件，再清理 ----
+# 旧版把级别放在 systemd drop-in 里靠重启生效；升级到本版后统一用级别文件 + SIGHUP。
+# 未显式 --log-level 且级别文件尚不存在时，把旧 drop-in 里的级别迁进来，避免升级丢级别。
+LEGACY_DROPIN="${SERVICE_PATH}.d/loglevel.conf"
+if [ ! -s "${LEVEL_FILE}" ] && [ -f "${LEGACY_DROPIN}" ]; then
+  OLD_LVL="$(grep -oE 'LOG_LEVEL=[a-zA-Z]+' "${LEGACY_DROPIN}" | head -1 | cut -d= -f2 || true)"
+  if [ -n "${OLD_LVL}" ]; then
+    mkdir -p "${BIN_DIR}"
+    printf '%s\n' "${OLD_LVL}" > "${LEVEL_FILE}"
+    echo "==> 迁移旧日志级别 ${OLD_LVL} → ${LEVEL_FILE}"
+  fi
+fi
+rm -f "${LEGACY_DROPIN}"
 
 # ---- 生成同名管理命令（占位符在安装期展开，运行期变量用 \$ 转义）----
 echo "==> 安装管理命令 ${WRAPPER}"
@@ -177,6 +197,7 @@ BIN_PATH="${BIN_PATH}"
 WRAPPER="${WRAPPER}"
 SERVICE_PATH="${SERVICE_PATH}"
 VERSION_FILE="${VERSION_FILE}"
+LEVEL_FILE="${LEVEL_FILE}"
 INSTALL_URL="${INSTALL_URL}"
 
 need_root() { [ "\$(id -u)" = "0" ] || { echo "需要 root：sudo \$NAME \$1" >&2; exit 1; }; }
@@ -192,12 +213,11 @@ case "\${1:-}" in
   update)   need_root update;  curl -fsSL "\$INSTALL_URL" | bash -s -- --name "\$NAME" ;;
   version)  cat "\$VERSION_FILE" 2>/dev/null || echo unknown ;;
   loglevel)
-    # 不带参数：显示当前级别；带参数：写 drop-in 覆盖 LOG_LEVEL 并重启
+    # 不带参数：显示当前级别；带参数：写级别文件并发 SIGHUP 热更新（不重启）
     shift
-    DROPIN="\${SERVICE_PATH}.d/loglevel.conf"
     if [ "\$#" -eq 0 ]; then
-      if [ -f "\$DROPIN" ]; then
-        grep -oE 'LOG_LEVEL=[a-zA-Z]+' "\$DROPIN" | head -1 | cut -d= -f2
+      if [ -s "\$LEVEL_FILE" ]; then
+        head -1 "\$LEVEL_FILE"
       else
         echo "info（默认，未显式设置）"
       fi
@@ -209,11 +229,15 @@ case "\${1:-}" in
       debug|info|warn|warning|error|fatal|off) : ;;
       *) echo "级别只能是 debug|info|warn|error|fatal|off（got '\$1'）" >&2; exit 1 ;;
     esac
-    mkdir -p "\${SERVICE_PATH}.d"
-    printf '[Service]\nEnvironment=LOG_LEVEL=%s\n' "\$LEVEL" > "\$DROPIN"
-    systemctl daemon-reload
-    systemctl restart "\$SERVICE"
-    echo "日志级别已设为 \$LEVEL 并重启 \$NAME"
+    mkdir -p "\$(dirname "\$LEVEL_FILE")"
+    printf '%s\n' "\$LEVEL" > "\$LEVEL_FILE"
+    # 服务在跑：发 SIGHUP 让进程重读级别文件，热更新、不重启；否则等下次启动生效
+    if systemctl is-active --quiet "\$SERVICE"; then
+      systemctl kill -s HUP "\$SERVICE"
+      echo "日志级别已设为 \$LEVEL 并热更新（未重启 \$NAME）"
+    else
+      echo "日志级别已写入 \$LEVEL（\$NAME 未运行，下次启动生效）"
+    fi
     ;;
   uninstall)
     need_root uninstall
@@ -231,7 +255,7 @@ case "\${1:-}" in
   \$NAME start | stop | restart    启动 / 停止 / 重启服务
   \$NAME status                    查看运行状态
   \$NAME logs [journalctl 参数]    查看日志（默认 -f 跟随；如 \$NAME logs -n 100）
-  \$NAME loglevel [级别]           查看/设置日志级别（debug|info|warn|error|fatal|off，设后自动重启）
+  \$NAME loglevel [级别]           查看/设置日志级别（debug|info|warn|error|fatal|off，热更新不重启）
   \$NAME enable | disable          开机自启 开 / 关
   \$NAME update                    更新到最新版并重启
   \$NAME version                   显示已安装版本

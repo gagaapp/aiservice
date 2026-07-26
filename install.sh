@@ -125,7 +125,12 @@ TAG="$(printf '%s' "${LATEST}" | tr -d '\r\n' | grep -oE '"tag_name":[[:space:]]
 DL_URL="$(printf '%s' "${LATEST}" | tr -d '\r\n' \
   | grep -oE "\"browser_download_url\":[[:space:]]*\"[^\"]*${ASSET}\"" | head -1 | sed 's/.*: *"//;s/"$//')"
 [ -n "${DL_URL}" ] || err "最新 release 未找到 ${ASSET}（仓库里有该架构产物吗？）"
-echo "    版本：${TAG:-unknown}"
+# 发布日期：github 用 published_at；gitee 无此字段则回退 created_at（release 级字段
+# 在 assets 之前，head -1 取到的即 release 本身的时间）。只取日期部分（去掉 T 之后）。
+RELEASED_AT="$(printf '%s' "${LATEST}" | tr -d '\r\n' | grep -oE '"published_at":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"$//' || true)"
+[ -n "${RELEASED_AT}" ] || RELEASED_AT="$(printf '%s' "${LATEST}" | tr -d '\r\n' | grep -oE '"created_at":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*: *"//;s/"$//' || true)"
+RELEASED_AT="${RELEASED_AT%%T*}"
+echo "    版本：${TAG:-unknown}（发布日期：${RELEASED_AT:-unknown}）"
 
 # ---- 下载并安装二进制 ----
 TMP="$(mktemp)"; trap 'rm -f "${TMP}"' EXIT
@@ -135,7 +140,8 @@ head -c4 "${TMP}" | grep -q $'\x7f''ELF' || err "下载内容不是 ELF 二进�
 systemctl is-active --quiet "${SERVICE_NAME}" && systemctl stop "${SERVICE_NAME}" || true
 mkdir -p "${BIN_DIR}"
 install -m 0755 "${TMP}" "${BIN_PATH}"
-printf '%s\n' "${TAG:-unknown}" > "${VERSION_FILE}"
+# .version 两行：第 1 行版本号，第 2 行发布日期（管理命令 version 子命令读取）
+printf '%s\n%s\n' "${TAG:-unknown}" "${RELEASED_AT:-unknown}" > "${VERSION_FILE}"
 
 # ---- 写 systemd unit（ExecStart=${BIN_PATH}，进程名即 ${NAME}）----
 echo "==> 写入 systemd 服务 ${SERVICE_PATH}"
@@ -211,7 +217,13 @@ case "\${1:-}" in
   disable)  need_root disable; systemctl disable "\$SERVICE"; echo "已取消开机自启" ;;
   logs)     shift; [ "\$#" -eq 0 ] && set -- -f; exec journalctl -u "\$SERVICE" "\$@" ;;
   update)   need_root update;  curl -fsSL "\$INSTALL_URL" | bash -s -- --name "\$NAME" ;;
-  version)  cat "\$VERSION_FILE" 2>/dev/null || echo unknown ;;
+  version)
+    # .version 两行：第 1 行版本号，第 2 行发布日期（旧版安装只有 1 行，日期显示 unknown）
+    VER="\$(sed -n 1p "\$VERSION_FILE" 2>/dev/null || true)"
+    REL="\$(sed -n 2p "\$VERSION_FILE" 2>/dev/null || true)"
+    echo "版本：\${VER:-unknown}"
+    echo "发布日期：\${REL:-unknown}"
+    ;;
   loglevel)
     # 不带参数：显示当前级别；带参数：写级别文件并发 SIGHUP 热更新（不重启）
     shift
@@ -258,7 +270,7 @@ case "\${1:-}" in
   \$NAME loglevel [级别]           查看/设置日志级别（debug|info|warn|error|fatal|off，热更新不重启）
   \$NAME enable | disable          开机自启 开 / 关
   \$NAME update                    更新到最新版并重启
-  \$NAME version                   显示已安装版本
+  \$NAME version                   显示已安装版本与发布日期
   \$NAME uninstall                 卸载
 USAGE
     ;;

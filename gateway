@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# gateway —— 境内加速中转（nginx stream 四层：终止 TLS_A，重新加密成 TLS_B 出境）
+#
+# 对接要点（改动前先读）：
+#   1. ALPN 必须与后端 tun-server 的 transport 一致。tun-server 的 alpnForTransport()
+#      是 h2/grpc -> [h2, http/1.1]、ws/none -> [http/1.1]。Go 的 TLS 服务端在客户端
+#      提供了 ALPN 而无交集时会返回 no_application_protocol 并中止握手，所以写死 h2
+#      会让 ws/none 实例整个连不上。`gateway check` 可直接验证这一点。
+#   2. proxy_ssl_alpn 需要 nginx >= 1.31.0，镜像不能降回 1.27。
+#   3. 不要加 proxy_protocol —— tun-server 目前不解析 PROXY 头，开了之后头会被当成
+#      首字节数据，分流直接失败。等 tun-server 支持后再议。
+#   4. 不做 per-IP / per-conn 限流。资源保护走全局 worker_connections + fd 上限；
+#      业务约束（限速/设备数）属于 V2bX 的 limiter。
+set -euo pipefail
+
+CONF_DIR="/etc/gateway"
+export MAPPINGS="$CONF_DIR/mappings.conf"
+export STREAM_DIR="$CONF_DIR/stream.d"
+export NGINX_IMAGE="nginx:1.31"          # proxy_ssl_alpn 需 >=1.31.0
+export CONTAINER="gateway"
+export SSL_DIR_FILE="$CONF_DIR/ssl_dir"
+export CAPACITY_FILE="$CONF_DIR/capacity.env"
+
+# 容量与超时默认值（可被 $CAPACITY_FILE 覆盖）。
+# stream 模式下一个客户端会话占用 2 个连接（客户端侧 + 上游侧），所以
+# 并发会话数 ≈ WORKER_CONNECTIONS / 2 * worker 数。
+: "${WORKER_CONNECTIONS:=65536}"
+: "${WORKER_RLIMIT_NOFILE:=262144}"
+# 双向静默超过它就断开会话。它同时是 tun-server 幽灵连接（客户端消失但不发 FIN，
+# 导致 relay 两个 io.Copy 永久阻塞、per-token slot 泄漏）的兜底，所以别设成永不超时。
+: "${PROXY_TIMEOUT:=1h}"
+: "${PROXY_CONNECT_TIMEOUT:=5s}"
+
+err() { echo "ERROR: $*" >&2; exit 1; }
+
+# 载入容量覆盖（如果有）
+gw_load_capacity() {
+  [ -f "$CAPACITY_FILE" ] || return 0
+  # shellcheck disable=SC1090
+  . "$CAPACITY_FILE"
+}
+
+# gw_alpn_for <transport> -> 两侧都要通告的 ALPN
+# 与 tun-server internal/gateway/gateway.go 的 alpnForTransport() 一一对应。
+gw_alpn_for() {
+  case "${1:-}" in
+    h2|grpc)  echo "h2" ;;
+    ws|none)  echo "http/1.1" ;;
+    "")       echo "h2" ;;   # 旧版 4 字段映射，保持既有行为（gw_render_all 会告警）
+    *)        err "未知 transport: $1（须为 none/ws/h2/grpc）" ;;
+  esac
+}
+
+# gw_render_server <port> <target> <sni> <cert_name> [transport]
+gw_render_server() {
+  local port="$1" target="$2" sni="$3" cert="$4" transport="${5:-}"
+  local alpn; alpn="$(gw_alpn_for "$transport")"
+  cat <<EOF
+# transport=${transport:-h2(legacy default)} -> ALPN ${alpn}
+server {
+    listen              ${port} ssl;
+    ssl_certificate     /ssl/${cert}.crt;
+    ssl_certificate_key /ssl/${cert}.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_alpn            ${alpn};
+    ssl_session_cache   shared:gw${port}:10m;
+    ssl_session_timeout 1h;
+
+    proxy_pass          ${target};
+    proxy_ssl           on;
+    proxy_ssl_server_name on;
+    proxy_ssl_name      ${sni};
+    proxy_ssl_alpn      ${alpn};
+    proxy_ssl_session_reuse on;
+
+    proxy_connect_timeout ${PROXY_CONNECT_TIMEOUT};
+    proxy_timeout       ${PROXY_TIMEOUT};
+    proxy_socket_keepalive on;
+}
+EOF
+}
+
+# gw_add <port> <target> <sni> <cert_name> <transport>
+gw_add() {
+  local port="$1" target="$2" sni="$3" cert="$4" transport="${5:-}"
+  echo "$port" | grep -qE '^[0-9]{1,5}$' || err "invalid port: $port"
+  [ -n "$transport" ] || err "缺少 transport（none/ws/h2/grpc）；它决定 ALPN，必须与后端 tun-server 一致"
+  gw_alpn_for "$transport" >/dev/null   # 校验枚举，非法值直接 err
+  mkdir -p "$CONF_DIR"
+  touch "$MAPPINGS"
+  gw_remove "$port" 2>/dev/null || true          # 同端口先删再加 = 覆盖
+  printf '%s|%s|%s|%s|%s\n' "$port" "$target" "$sni" "$cert" "$transport" >> "$MAPPINGS"
+}
+
+# gw_remove <port>
+gw_remove() {
+  local port="$1"
+  [ -f "$MAPPINGS" ] || return 0
+  grep -v -E "^${port}\|" "$MAPPINGS" > "$MAPPINGS.tmp" || true
+  mv "$MAPPINGS.tmp" "$MAPPINGS"
+}
+
+gw_list() {
+  [ -f "$MAPPINGS" ] && cat "$MAPPINGS" || true
+}
+
+# gw_render_all: 清空 stream.d 后按 mappings 重新渲染
+gw_render_all() {
+  rm -rf "$STREAM_DIR"; mkdir -p "$STREAM_DIR"
+  [ -f "$MAPPINGS" ] || return 0
+  local port target sni cert transport
+  while IFS='|' read -r port target sni cert transport; do
+    [ -n "$port" ] || continue
+    if [ -z "${transport:-}" ]; then
+      echo "WARN: 映射 :$port 没有 transport 字段（旧格式），按 h2 渲染；请用 'gateway add' 重新配置" >&2
+    fi
+    gw_render_server "$port" "$target" "$sni" "$cert" "${transport:-}" > "$STREAM_DIR/$port.conf"
+  done < "$MAPPINGS"
+}
+
+# gw_probe_alpn <target> <sni> <alpn> -> 打印后端实际协商到的 ALPN（失败则空）
+# 用真实 TLS 握手探测后端 tun-server，是验证 transport 配对的唯一可靠手段。
+gw_probe_alpn() {
+  local target="$1" sni="$2" want="$3" out
+  command -v openssl >/dev/null 2>&1 || return 2
+  out="$(echo | openssl s_client -connect "$target" -servername "$sni" \
+           -alpn "$want" -verify_return_error 2>/dev/null \
+         | grep -i '^ALPN protocol:' || true)"
+  # "ALPN protocol: h2" -> "h2"；未协商时 openssl 打印 "No ALPN negotiated"
+  case "$out" in
+    *:*) echo "${out#*: }" ;;
+    *)   echo "" ;;
+  esac
+}
+
+# gw_check: 逐条映射用其 ALPN 去握后端，验证 gateway 与 tun-server 的 transport 配对
+gw_check() {
+  [ -s "$MAPPINGS" ] || { echo "无映射"; return 0; }
+  command -v openssl >/dev/null 2>&1 || err "需要 openssl 才能自检"
+  local port target sni cert transport alpn got rc=0
+  while IFS='|' read -r port target sni cert transport; do
+    [ -n "$port" ] || continue
+    alpn="$(gw_alpn_for "${transport:-}")"
+    got="$(gw_probe_alpn "$target" "$sni" "$alpn")"
+    if [ "$got" = "$alpn" ]; then
+      printf 'OK    :%s -> %s  transport=%-4s alpn=%s\n' \
+        "$port" "$target" "${transport:-h2?}" "$alpn"
+    else
+      printf 'FAIL  :%s -> %s  transport=%-4s 期望 alpn=%s 实得=%s\n' \
+        "$port" "$target" "${transport:-h2?}" "$alpn" "${got:-<握手失败>}"
+      rc=1
+    fi
+  done < "$MAPPINGS"
+  [ "$rc" = 0 ] || echo "提示: FAIL 多为 transport 与后端 tun-server 不一致，或 SNI/证书不匹配、后端不可达。"
+  return $rc
+}
+
+gw_ssl_dir() {
+  [ -f "$SSL_DIR_FILE" ] || err "ssl dir not set; run 'gateway' menu to set it"
+  cat "$SSL_DIR_FILE"
+}
+
+gw_write_nginx_conf() {
+  mkdir -p "$CONF_DIR"
+  cat > "$CONF_DIR/nginx.conf" <<EOF
+# 由 gateway 命令生成，勿手改（改 $CAPACITY_FILE 后 gateway restart）
+worker_processes     auto;
+worker_rlimit_nofile ${WORKER_RLIMIT_NOFILE};
+
+events {
+    worker_connections ${WORKER_CONNECTIONS};
+    multi_accept on;
+}
+
+stream {
+    # 刻意不配置 limit_conn：中转不做 per-IP 并发配额（CGNAT 下必然误伤），
+    # 资源保护由 worker_connections + worker_rlimit_nofile 全局承担。
+    log_format gw '\$remote_addr -> \$upstream_addr sni=\$ssl_server_name '
+                  'alpn=\$ssl_alpn_protocol status=\$status '
+                  'in=\$bytes_received out=\$bytes_sent dur=\$session_time';
+    access_log /dev/stdout gw;
+    include /etc/nginx/conf-managed/stream.d/*.conf;
+}
+EOF
+}
+
+gw_start() {
+  local ssl; ssl="$(gw_ssl_dir)"
+  gw_load_capacity
+  gw_write_nginx_conf
+  gw_render_all
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  docker run -d --name "$CONTAINER" --restart always --network host \
+    --ulimit "nofile=${WORKER_RLIMIT_NOFILE}:${WORKER_RLIMIT_NOFILE}" \
+    -v "$CONF_DIR:/etc/nginx/conf-managed:ro" \
+    -v "$ssl:/ssl:ro" \
+    -v "$CONF_DIR/nginx.conf:/etc/nginx/nginx.conf:ro" \
+    "$NGINX_IMAGE"
+}
+
+gw_stop()    { docker rm -f "$CONTAINER" >/dev/null 2>&1 || true; }
+gw_restart() { gw_stop; gw_start; }
+gw_status()  { docker ps -a --filter "name=^${CONTAINER}$"; }
+gw_logs()    { docker logs -f "$CONTAINER"; }
+gw_reload()  { gw_load_capacity; gw_render_all; docker exec "$CONTAINER" nginx -s reload; }
+
+# 添加映射的交互流程：先探测后端 ALPN，再让用户确认 transport。
+gw_add_interactive() {
+  local p t s cn tr hint
+  read -r -p "监听端口: " p
+  read -r -p "境外 tun-server host:port: " t
+  read -r -p "伪装域名 SNI: " s
+  read -r -p "证书名(不含扩展名): " cn
+  hint=""
+  if command -v openssl >/dev/null 2>&1; then
+    echo "==> 探测后端 ALPN ..."
+    if [ "$(gw_probe_alpn "$t" "$s" h2)" = "h2" ]; then
+      hint="h2"; echo "    后端协商到 h2  → transport 应填 h2 或 grpc"
+    elif [ "$(gw_probe_alpn "$t" "$s" http/1.1)" = "http/1.1" ]; then
+      hint="ws"; echo "    后端协商到 http/1.1 → transport 应填 ws 或 none"
+    else
+      echo "    探测失败（后端不可达 / SNI 或证书不匹配），请手动确认"
+    fi
+  fi
+  read -r -p "transport (none/ws/h2/grpc)${hint:+ [建议 $hint]}: " tr
+  tr="${tr:-$hint}"
+  gw_add "$p" "$t" "$s" "$cn" "$tr"
+}
+
+gw_menu() {
+  while true; do
+    cat <<'EOF'
+
+==> gateway 管理菜单
+  1) 添加端口映射（含后端 ALPN 探测）
+  2) 删除端口映射
+  3) 查看映射列表
+  4) 设置/修改 ssl 目录
+  5) 启动 / 重启
+  6) 停止
+  7) 状态
+  8) 日志
+  9) 自检（验证与后端 tun-server 的 transport 配对）
+ 10) 卸载
+  0) 退出
+EOF
+    read -r -p "选择: " c
+    case "$c" in
+      1) gw_add_interactive; gw_reload 2>/dev/null || true; echo "已添加" ;;
+      2) read -r -p "要删除的端口: " p; gw_remove "$p"; gw_reload 2>/dev/null || true; echo "已删除" ;;
+      3) gw_list ;;
+      4) read -r -p "ssl 目录绝对路径: " d; mkdir -p "$CONF_DIR"; echo "$d" > "$SSL_DIR_FILE"; echo "已设置: $d" ;;
+      5) gw_start; echo "已启动/重启" ;;
+      6) gw_stop; echo "已停止" ;;
+      7) gw_status ;;
+      8) gw_logs ;;
+      9) gw_check || true ;;
+      10) gw_uninstall; return ;;
+      0) return ;;
+      *) echo "无效选择" ;;
+    esac
+  done
+}
+
+gw_uninstall() {
+  gw_stop
+  rm -f /usr/local/bin/gateway
+  echo "已卸载容器与命令（保留 $CONF_DIR 配置与证书）"
+}
+
+usage() {
+  cat <<'EOF'
+usage: gateway [command]
+  (no command)   打开交互菜单
+  add <port> <target> <sni> <cert_name> <transport>
+                 transport: none|ws|h2|grpc —— 必须与后端 tun-server 的 transport 一致
+  remove <port>
+  list
+  check          逐条映射握手后端，验证 ALPN/transport 配对
+  start | restart | stop | status | logs | reload
+  update         重新下载并更新 gateway 命令
+  uninstall
+
+容量与超时可在 /etc/gateway/capacity.env 覆盖（shell 变量语法）：
+  WORKER_CONNECTIONS=65536      # stream 每会话占 2 个连接
+  WORKER_RLIMIT_NOFILE=262144
+  PROXY_TIMEOUT=1h              # 双向空闲超时，兼作后端幽灵连接兜底
+  PROXY_CONNECT_TIMEOUT=5s
+EOF
+}
+
+gw_update() {
+  local base="${GATEWAY_INSTALL_URL:-https://raw.githubusercontent.com/gagaapp/aiservice/main}"
+  curl -fsSL "$base/gateway" -o /usr/local/bin/gateway
+  chmod +x /usr/local/bin/gateway
+  echo "gateway 命令已更新"
+}
+
+main() {
+  gw_load_capacity
+  local cmd="${1:-}"
+  case "$cmd" in
+    add)       shift; gw_add "$@" ;;
+    remove)    shift; gw_remove "$@" ;;
+    list)      gw_list ;;
+    check)     gw_check ;;
+    start)     gw_start ;;
+    restart)   gw_restart ;;
+    stop)      gw_stop ;;
+    status)    gw_status ;;
+    logs)      gw_logs ;;
+    reload)    gw_reload ;;
+    update)    gw_update ;;
+    uninstall) gw_uninstall ;;
+    menu)      gw_menu ;;
+    "")        if [ -t 0 ]; then gw_menu; else usage; fi ;;
+    *)         usage; return 1 ;;
+  esac
+}
+
+# main guard: 被 source（测试）时不执行 main
+if [ "${GATEWAY_LIB:-0}" != "1" ]; then
+  main "$@"
+fi

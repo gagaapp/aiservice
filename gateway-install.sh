@@ -241,11 +241,60 @@ install -m 0755 "${TMP}" "${BIN_PATH}"
 printf '%s\n%s\n' "${TAG:-unknown}" "${RELEASED_AT:-unknown}" > "${VERSION_FILE}"
 
 # ---- 拉 nginx 镜像 ----
-echo "==> 拉取 nginx 镜像 ${NGINX_IMAGE}（要求 >= ${NGINX_MIN_VERSION}）"
-docker pull "${NGINX_IMAGE}" >/dev/null || err "拉取镜像失败。境内直连 Docker Hub 常拉不动：
-     · 本脚本只在自动安装 docker 时才写 /etc/docker/daemon.json；机器上已有该文件时不会覆盖，
-       可自行在其中加 registry-mirrors 后 systemctl restart docker 重试
-     · 或在别处 docker save ${NGINX_IMAGE} 后传到本机 docker load"
+#
+# 境内直连 Docker Hub 基本拉不动, 而且 `docker pull` **没有超时**, 会一直挂着 ——
+# 这是最容易让人以为"装死了"的地方。这里的策略:
+#
+#   1. 本地已有该镜像 → 直接用, 不联网。
+#   2. 直连试一次, 但**加超时**, 失败就往下走, 不挂死。
+#   3. 依次从镜像站拉, 成功后 re-tag 成规范名 —— 这样后面 docker run 用的名字不变。
+#
+# 关键是第 3 步**不碰这台机器的 /etc/docker/daemon.json**: 已经在用 docker 的机器,
+# 它的 registry 配置是运维的东西, 装个 gateway 不该去改。镜像站前缀只作用于这一次拉取。
+MIRROR_PREFIXES="docker.m.daocloud.io docker.1ms.run hub.rat.dev dockerproxy.com"
+
+run_timeout() {  # $1=秒, 其余=命令; 没有 timeout(1) 就直接跑
+  local s="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; else "$@"; fi
+}
+
+pull_nginx() {
+  echo "==> 准备 nginx 镜像 ${NGINX_IMAGE}（要求 >= ${NGINX_MIN_VERSION}）"
+  if docker image inspect "${NGINX_IMAGE}" >/dev/null 2>&1; then
+    echo "    本地已有，跳过拉取"
+    return 0
+  fi
+
+  # 只给直连 20s: 通的话远快于此; 不通的话(境内常态)不该每次装都白等一分钟。
+  echo "    直连 Docker Hub（最多等 20s）…"
+  if run_timeout 20 docker pull "${NGINX_IMAGE}" >/dev/null 2>&1; then
+    echo "    拉取成功"
+    return 0
+  fi
+  echo "    直连超时或失败，改用境内镜像站"
+
+  # nginx 是官方镜像, 在镜像站上的路径是 <mirror>/library/nginx:<tag>
+  local repo="${NGINX_IMAGE%%:*}" tag="${NGINX_IMAGE##*:}" m src
+  [ "${repo}" = "${tag}" ] && tag="latest"
+  for m in ${MIRROR_PREFIXES}; do
+    src="${m}/library/${repo}:${tag}"
+    echo "    尝试 ${src}"
+    if run_timeout 120 docker pull "${src}" >/dev/null 2>&1; then
+      # 改回规范名: 后面 docker run 与管理命令用的都是 ${NGINX_IMAGE}, 不必知道从哪拉的
+      docker tag "${src}" "${NGINX_IMAGE}"
+      docker rmi "${src}" >/dev/null 2>&1 || true
+      echo "    成功（经 ${m}）"
+      return 0
+    fi
+  done
+
+  err "nginx 镜像拉取失败：直连与所有镜像站都不通。可选办法：
+     · 指定一个你能访问的镜像：GATEWAY_NGINX_IMAGE=<你的仓库>/nginx:1.27 重跑本脚本
+     · 或在能联网的机器上 docker save ${NGINX_IMAGE} -o nginx.tar，传到本机 docker load -i nginx.tar 后重跑
+     · 或自行在 /etc/docker/daemon.json 配 registry-mirrors 并 systemctl restart docker
+       （本脚本不会去改这台机器已有的 docker 配置）"
+}
+pull_nginx
 
 # ---- 写本机配置 ----
 echo "==> 写入本机配置 ${ENV_FILE}"

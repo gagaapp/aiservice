@@ -20,6 +20,8 @@
 #   sudo ./install.sh --cert-name mysite               # 证书名 → <dir>/<name>.crt|.key
 #   sudo ./install.sh --tls-ca-file /etc/ssl/ca.pem    # 私有 CA（staging/自签环境必给）
 #   sudo ./install.sh --name gw2                       # 自定义服务/命令名
+#   sudo ./install.sh --no-docker-install              # 不自动装 docker（自己管）
+#   sudo ./install.sh --no-mirror                      # 不配置境内镜像加速
 #   sudo ./install.sh --log-level debug
 #   sudo ./install.sh uninstall
 #
@@ -34,6 +36,10 @@
 #   一直拒绝、永不进入服务态。
 # - 这里只配这台机器的物理属性：端口、证书目录。TLS_A 私钥永远不进控制面。
 # - 证书必须是真实域名 + 受信任 CA 签发；自签是明显可疑信号。本脚本不申请、不续期。
+# - docker 缺失会自动安装（nginx 以容器运行）。已装 docker 的机器一律不碰其配置；
+#   只有「本脚本刚装的 docker」且机器上还没有 /etc/docker/daemon.json 时，才会写一份
+#   镜像加速配置——境内直连 Docker Hub 基本拉不动。用 --no-docker-install /
+#   --no-mirror 可分别关掉这两件事。
 #
 set -euo pipefail
 
@@ -71,6 +77,8 @@ LOOPBACK_PORT=""
 SSL_DIR=""
 CERT_NAME=""
 TLS_CA_FILE=""
+NO_DOCKER_INSTALL=0     # 自己管 docker 的运维可以关掉自动安装
+NO_MIRROR=0             # 关掉境内镜像加速（境外机器或已有自定义配置时）
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -88,6 +96,8 @@ while [ $# -gt 0 ]; do
     --cert-name=*)     CERT_NAME="${1#--cert-name=}"; shift ;;
     --tls-ca-file)     TLS_CA_FILE="${2:-}"; shift 2 ;;
     --tls-ca-file=*)   TLS_CA_FILE="${1#--tls-ca-file=}"; shift ;;
+    --no-docker-install) NO_DOCKER_INSTALL=1; shift ;;
+    --no-mirror)       NO_MIRROR=1; shift ;;
     uninstall)         ACTION="uninstall"; shift ;;
     *) echo "ERROR: 未知参数 '$1'（用法见脚本头部注释）" >&2; exit 1 ;;
   esac
@@ -132,7 +142,54 @@ fi
 
 command -v curl      >/dev/null 2>&1 || err "需要 curl"
 command -v systemctl >/dev/null 2>&1 || err "需要 systemd（systemctl 不存在）"
-command -v docker    >/dev/null 2>&1 || err "需要 docker（nginx 以容器方式运行）"
+
+# ---- docker：没有就装 ----
+# gateway 必须有 docker（nginx 以容器运行）。一键脚本不该在这里把人挡在门外，所以
+# 缺了就自动装；已经有了就完全不碰——绝不去动一台已在用 docker 的机器的配置。
+ensure_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    docker info >/dev/null 2>&1 || { systemctl enable --now docker >/dev/null 2>&1 || true; }
+    docker info >/dev/null 2>&1 || err "docker 已安装但守护进程起不来（systemctl status docker 看看）"
+    echo "==> docker 已就绪（$(docker --version 2>/dev/null | head -1)）"
+    return 0
+  fi
+  [ "${NO_DOCKER_INSTALL}" = "1" ] && err "未安装 docker，且指定了 --no-docker-install"
+
+  echo "==> 未检测到 docker，开始安装"
+  # 官方便捷脚本；gateway 按定义装在境内，默认走阿里云镜像，否则大概率卡死。
+  # --mirror 只影响下载 docker 自身的软件源，与后面拉 nginx 镜像是两回事。
+  local args=""
+  [ "${NO_MIRROR}" = "1" ] || args="--mirror Aliyun"
+  # shellcheck disable=SC2086
+  if ! curl -fsSL --connect-timeout 30 --retry 2 https://get.docker.com | sh -s -- ${args}; then
+    err "docker 自动安装失败。请手动安装后重跑，或用发行版包管理器：
+       Debian/Ubuntu: apt-get update && apt-get install -y docker.io
+       CentOS/RHEL:   yum install -y docker
+     装好后重跑本脚本（已装好的部分会被覆盖重装，安全）"
+  fi
+  systemctl enable --now docker >/dev/null 2>&1 || true
+  docker info >/dev/null 2>&1 || err "docker 装上了但守护进程起不来（systemctl status docker 看看）"
+  echo "    已安装 $(docker --version 2>/dev/null | head -1)"
+
+  # 只在「我们刚装的 docker」且「还没有 daemon.json」时配镜像加速：
+  # 境内直连 Docker Hub 基本拉不动。绝不覆盖运维已有的配置。
+  if [ "${NO_MIRROR}" != "1" ] && [ ! -f /etc/docker/daemon.json ]; then
+    echo "    配置镜像加速（/etc/docker/daemon.json）"
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json <<'DAEMON'
+{
+  "registry-mirrors": [
+    "https://docker.m.daocloud.io",
+    "https://dockerproxy.com",
+    "https://mirror.baidubce.com"
+  ]
+}
+DAEMON
+    systemctl restart docker >/dev/null 2>&1 || true
+    docker info >/dev/null 2>&1 || err "配置镜像加速后 docker 起不来，请检查 /etc/docker/daemon.json"
+  fi
+}
+ensure_docker
 
 # ---- 继承已有配置：重装时不写 --xxx 就沿用旧值 ----
 mkdir -p "${CONF_DIR}"
@@ -185,7 +242,10 @@ printf '%s\n%s\n' "${TAG:-unknown}" "${RELEASED_AT:-unknown}" > "${VERSION_FILE}
 
 # ---- 拉 nginx 镜像 ----
 echo "==> 拉取 nginx 镜像 ${NGINX_IMAGE}（要求 >= ${NGINX_MIN_VERSION}）"
-docker pull "${NGINX_IMAGE}" >/dev/null || err "拉取镜像失败（境内通常需要先配置镜像加速器，或手动 docker load）"
+docker pull "${NGINX_IMAGE}" >/dev/null || err "拉取镜像失败。境内直连 Docker Hub 常拉不动：
+     · 本脚本只在自动安装 docker 时才写 /etc/docker/daemon.json；机器上已有该文件时不会覆盖，
+       可自行在其中加 registry-mirrors 后 systemctl restart docker 重试
+     · 或在别处 docker save ${NGINX_IMAGE} 后传到本机 docker load"
 
 # ---- 写本机配置 ----
 echo "==> 写入本机配置 ${ENV_FILE}"

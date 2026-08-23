@@ -117,6 +117,9 @@ BIN_PATH="${BIN_DIR}/${NAME}"
 WRAPPER="/usr/local/bin/${NAME}"
 SERVICE_NAME="${NAME}"
 SERVICE_PATH="/etc/systemd/system/${NAME}.service"
+# sysctl drop-in: 摘掉本机端口/TIME_WAIT 天花板。用独立文件而不是改 sysctl.conf,
+# 删掉它即可完全还原。
+SYSCTL_DROPIN="/etc/sysctl.d/99-${NAME}.conf"
 VERSION_FILE="${BIN_DIR}/.version"
 LEVEL_FILE="${BIN_DIR}/loglevel"
 CONF_DIR="/etc/${NAME}"
@@ -135,6 +138,8 @@ if [ "${ACTION}" = "uninstall" ]; then
   docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
   rm -f "${SERVICE_PATH}" "${WRAPPER}"
   rm -rf "${SERVICE_PATH}.d" "${BIN_DIR}"
+  rm -f "${SYSCTL_DROPIN}"
+  sysctl --system >/dev/null 2>&1 || true
   systemctl daemon-reload 2>/dev/null || true
   echo "已卸载（${CONF_DIR} 下的证书与配置未删除）"
   exit 0
@@ -575,6 +580,8 @@ case "\${1:-}" in
     docker rm -f "\$CONTAINER" >/dev/null 2>&1 || true
     rm -f "\$SERVICE_PATH" "\$WRAPPER"
     rm -rf "\${SERVICE_PATH}.d" "\$(dirname "\$BIN_PATH")"
+    rm -f "${SYSCTL_DROPIN}"
+    sysctl --system >/dev/null 2>&1 || true
     systemctl daemon-reload 2>/dev/null || true
     echo "已卸载 \$NAME（证书与配置未删除）"
     ;;
@@ -608,6 +615,27 @@ USAGE
 esac
 WRAP
 chmod 0755 "${WRAPPER}"
+
+# ---- 摘掉本机的硬天花板 ----
+#
+# 数据面是 1:1 的: 每个用户会话占一条跨境 TCP 连接。默认的 sysctl 会在几万连接上
+# 先撞墙, 而撞墙表现为 connect() 返回 EADDRNOTAVAIL —— 一个很难查的报错。
+# 下面两项都是**摘天花板**, 不是限流:
+#
+#   * ip_local_port_range: 出向源端口数从默认约 2.8w 提到约 6.4w。
+#   * tcp_tw_reuse: gateway 是主动连接方, 会话结束后源端口会压在 TIME_WAIT 60s。
+#     这个选项允许出向连接复用它们(依赖 TCP 时间戳, 对主动连接方是安全的)。
+#
+#   * **不开 tcp_tw_recycle**: 现代内核已移除, 且会在 NAT 后误丢连接。
+#
+# 用 drop-in 而不是改 /etc/sysctl.conf: 卸载时删掉这个文件即可完全还原。
+echo "==> 写入 sysctl(摘掉端口与 TIME_WAIT 的天花板)"
+cat >"${SYSCTL_DROPIN}" <<'SYSCTL'
+# 由 netun gateway 安装脚本写入。删除本文件即可完全还原。
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+SYSCTL
+sysctl --system >/dev/null 2>&1 || echo "警告: sysctl 应用失败, 高并发下可能提前撞到端口上限"
 
 # ---- 启用并启动 ----
 echo "==> 启用并启动服务"

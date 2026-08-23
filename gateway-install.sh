@@ -8,7 +8,7 @@
 #
 # 形态：
 #   leaf ─境内─► nginx(终 TLS_A) ─loopback+proxy_protocol─► gateway(go)
-#                                                             │ K 条 smux in TLS_B
+#                                                             │ 每会话一条 TLS_B
 #                                                             ▼  跨境
 #                                                       tun-server(中继态)
 #
@@ -31,7 +31,7 @@
 #   # 追加参数示例： ... | sudo bash -s -- --listen-port 8443
 #
 # 说明：
-# - 绑定哪台 tun-server、出境 SNI、transport、承载数 K 都**不在这里配**——gateway
+# - 绑定哪台 tun-server、出境 SNI、transport、预热连接下限都**不在这里配**——gateway
 #   启动后按本机公网 IP 向 heihaweb 认领，配置全部由控制面下发。未授权的 IP 会被
 #   一直拒绝、永不进入服务态。
 # - 这里只配这台机器的物理属性：端口、证书目录。TLS_A 私钥永远不进控制面。
@@ -305,7 +305,7 @@ pull_nginx
 echo "==> 写入本机配置 ${ENV_FILE}"
 cat > "${ENV_FILE}" <<ENV
 # 由 install.sh 生成。这些是本机的物理属性，不由 heihaweb 下发。
-# 绑定的 tun-server / SNI / transport / 承载数 K 全部来自控制面。
+# 绑定的 tun-server / SNI / transport / 预热连接下限全部来自控制面。
 GW_LISTEN_PORT=${LISTEN_PORT}
 GW_LOOPBACK_PORT=${LOOPBACK_PORT}
 GW_SSL_DIR=${SSL_DIR}
@@ -315,8 +315,10 @@ ENV
 
 # ---- 写 systemd unit ----
 # 两个约定:
-#   * -ssl-dir 传 /ssl 而不是宿主机路径: nginx 跑在容器里, 配置里的证书路径必须是
-#     容器内视角; 宿主机的 ${SSL_DIR} 由管理命令挂载到容器的 /ssl。
+#   * 证书目录**同名挂载**进容器(宿主机路径 == 容器内路径), 所以 nginx.conf 里写的
+#     就是宿主机上那个真实路径, 没有"宿主机视角 / 容器视角"两套语义。
+#     挂目录不挂文件: bind mount 绑的是 inode, 而证书续期是"写新文件 + rename 替换",
+#     挂文件的话容器里会永远看到旧证书。目录 inode 不变, 续期后直接生效。
 #   * 端口等本机参数**不烧进 ExecStart**, 而是经 EnvironmentFile 引用 —— 否则改一个
 #     端口就得重写 unit(或者像最初那样重跑整个安装脚本、连带重新下载二进制和镜像)。
 #     现在 `gateway set` 只改 env 文件再重启即可, 不碰网络。
@@ -331,7 +333,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=${ENV_FILE}
-ExecStart=${BIN_PATH} -listen-port \${GW_LISTEN_PORT} -loopback-port \${GW_LOOPBACK_PORT} -ssl-dir /ssl -cert-name \${GW_CERT_NAME} -tls-ca-file \${GW_TLS_CA_FILE} -nginx-conf ${NGINX_CONF} -nginx-reload '${WRAPPER} restart-nginx' 
+ExecStart=${BIN_PATH} -tls-ca-file \${GW_TLS_CA_FILE} -env-file ${ENV_FILE} -nginx-conf ${NGINX_CONF} -nginx-reload '${WRAPPER} restart-nginx' 
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -378,7 +380,7 @@ nginx_start() {
   docker rm -f "\$CONTAINER" >/dev/null 2>&1 || true
   docker run -d --name "\$CONTAINER" --restart unless-stopped --network host \\
     -v "\${NGINX_CONF}:/etc/nginx/nginx.conf:ro" \\
-    -v "\${GW_SSL_DIR}:/ssl:ro" \\
+    -v "\${GW_SSL_DIR}:\${GW_SSL_DIR}:ro" \\
     "\$NGINX_IMAGE" >/dev/null
   echo "nginx 已启动（\$CONTAINER）"
 }
@@ -389,7 +391,7 @@ write_env() {
   local tmp; tmp="\$(mktemp)"
   cat > "\$tmp" <<ENV
 # 由 \$NAME set / install.sh 生成。这些是本机的物理属性, 不由 heihaweb 下发。
-# 绑定的 tun-server / SNI / transport / 承载数 K 全部来自控制面。
+# 绑定的 tun-server / SNI / transport / 预热连接下限全部来自控制面。
 GW_LISTEN_PORT=\${GW_LISTEN_PORT}
 GW_LOOPBACK_PORT=\${GW_LOOPBACK_PORT}
 GW_SSL_DIR=\${GW_SSL_DIR}
@@ -411,7 +413,7 @@ print_conf() {
   fi
   [ -n "\${GW_TLS_CA_FILE:-}" ] && echo "TLS_B 信任锚          : \${GW_TLS_CA_FILE}" || true
   echo
-  echo "绑定的 tun-server、出境 SNI、transport、承载数 K 由 heihaweb 下发, 不在本机配。"
+  echo "绑定的 tun-server、出境 SNI、transport、预热连接下限由 heihaweb 下发, 不在本机配。"
 }
 
 # gw_menu 是交互式菜单。它只是把下面那些子命令包一层 —— 所有动作仍走同一条路径,
@@ -586,10 +588,13 @@ case "\${1:-}" in
     echo "已卸载 \$NAME（证书与配置未删除）"
     ;;
   menu) gw_menu ;;
-  "")
+  ""|help|-h|--help)
     # 不带子命令: 有终端就进菜单, 没有(管道/脚本/systemd 调用)就打印用法 ——
     # 菜单在非交互环境下会读到 EOF 死循环, 必须按 TTY 分流。
-    if [ -t 0 ] && [ -t 1 ]; then gw_menu; exit 0; fi
+    #
+    # help/-h/--help 一律直接打用法, 不进菜单: 明确问"支持哪些命令"的人要的是
+    # 那张列表, 不是一个要交互的界面。
+    if [ -z "${1:-}" ] && [ -t 0 ] && [ -t 1 ]; then gw_menu; exit 0; fi
     cat <<USAGE
 \$NAME 管理命令：
   \$NAME                           不带参数进入交互菜单（需终端）
@@ -608,9 +613,16 @@ case "\${1:-}" in
   \$NAME version                   显示已安装版本与发布日期
   \$NAME uninstall                 卸载
 
-绑定哪台 tun-server、出境 SNI、transport、承载数 K 都由 heihaweb 下发，
+绑定哪台 tun-server、出境 SNI、transport、预热连接下限都由 heihaweb 下发，
 本机只管端口与证书（用 \$NAME set 改，重装时不写的参数沿用旧值）。
 USAGE
+    ;;
+  *)
+    # 兜底: 没有它的话, 敲错的子命令会静默什么都不做、退出码还是 0 —— 运维会
+    # 以为命令生效了。宁可吵一点。
+    echo "未知命令: \$1" >&2
+    echo "可用命令: \$NAME help" >&2
+    exit 2
     ;;
 esac
 WRAP

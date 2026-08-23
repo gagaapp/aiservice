@@ -535,12 +535,20 @@ case "\${1:-}" in
   logs)     shift; [ "\$#" -eq 0 ] && set -- -f; exec journalctl -u "\$SERVICE" "\$@" ;;
   restart-nginx)
     # gateway(go) 在重写 nginx.conf 后会调用它。优先热重载(不断连)，未运行则拉起。
+    #
+    # 但热重载换不掉 bind mount —— ssl 目录是 docker run 时定死的。控制面把 ssl_dir
+    # 改掉后, nginx.conf(文件挂载、原地重写)立刻指向新路径, 容器里却还是旧目录, 于是
+    # nginx 一加载证书就 "cannot load certificate"。所以先确认容器真看得见 env 里那个
+    # 目录; 看不见说明挂载已过时, 只能重建(会断开在途连接, 换挂载没有别的办法)。
+    # 手工 \`set --ssl-dir\` 那条路径本来就会重建, 下发这条以前漏了。
     need_root restart-nginx
-    if nginx_running; then
+    load_env
+    if nginx_running && docker exec "\$CONTAINER" test -d "\${GW_SSL_DIR:-}" 2>/dev/null; then
       docker exec "\$CONTAINER" nginx -t || { echo "配置校验失败，未重载" >&2; exit 1; }
       docker exec "\$CONTAINER" nginx -s reload
       echo "nginx 已重载（现有连接不受影响）"
     else
+      nginx_running && echo "证书目录 \${GW_SSL_DIR:-?} 在容器内不可见（挂载已过时），重建容器（现有连接会断开）"
       nginx_start
     fi
     ;;

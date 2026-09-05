@@ -63,8 +63,9 @@ case "${PROVIDER}" in
 esac
 RELEASE_BIN="gateway"           # release 附件基名（build.sh 产出 gateway-linux-*）
 
-# 渲染的 nginx.conf 用到 ssl_alpn —— stream 模块 1.21.4 才引入的指令，更老的镜像会
-# 以 `unknown directive "ssl_alpn"` 启动失败（1.21.1 实测）。换镜像前先确认版本。
+# 渲染的 nginx.conf 用到 ssl_alpn 与 proxy_half_close —— 都是 stream 模块 1.21.4 才引入
+# 的指令，更老的镜像会以 `unknown directive "ssl_alpn"` 启动失败（1.21.1 实测）。
+# 换镜像前先确认版本。
 NGINX_MIN_VERSION="1.21.4"
 NGINX_IMAGE="${GATEWAY_NGINX_IMAGE:-nginx:1.27}"
 

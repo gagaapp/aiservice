@@ -21,6 +21,9 @@
 #
 # 说明：
 # - 装好后用「<名称> <子命令>」管理，例如 tun-server restart / tun-server logs。
+# - 日志：进程自己写 BIN_DIR/logs/tun-server.log（按天 + 100 MiB 切，最多留 30 份，
+#   自动删旧），不再经 journald/rsyslog（那条路会在 syslog、daemon.log 各复制一份）。
+#   「<名称> logs」看的就是这个文件；Go 运行时 panic 不走日志库，仍在 journalctl -u。
 # - 调日志级别：「<名称> loglevel debug」运行期热更新（发 SIGHUP，不重启）；不带
 #   参数则查看当前级别。级别存于 BIN_DIR/loglevel 文件，进程启动读它、收 SIGHUP
 #   重读；update 重装后保留，uninstall 随目录删除。
@@ -86,6 +89,9 @@ SERVICE_PATH="/etc/systemd/system/${NAME}.service"
 VERSION_FILE="${BIN_DIR}/.version"
 LEVEL_FILE="${BIN_DIR}/loglevel"          # 日志级别文件；unit 用 LOG_LEVEL_FILE 指向它，
                                           # 进程启动读一次、收到 SIGHUP 再热更新（不重启）
+LOG_DIR="${BIN_DIR}/logs"                 # 日志目录；进程默认就写 <二进制目录>/logs，
+                                          # unit 里再显式给一遍，避免二进制路径变了对不上
+LOG_FILE="${LOG_DIR}/tun-server.log"      # 文件名是二进制里定死的，与 --name 无关
 
 err() { echo "ERROR: $*" >&2; exit 1; }
 [ "$(id -u)" = "0" ] || err "请用 root 运行（sudo）"
@@ -160,6 +166,8 @@ RestartSec=3
 LimitNOFILE=1048576
 # 日志级别文件：进程启动读它、收到 SIGHUP 再热更新（见「<名称> loglevel」）
 Environment=LOG_LEVEL_FILE=${LEVEL_FILE}
+# 日志文件目录：进程自己按天/按大小切并清理，不走 journald（见「<名称> logs」）
+Environment=LOG_DIR=${LOG_DIR}
 # 监听 :443 需特权端口，且需读取 heihaweb 下发路径的 cert/key
 User=root
 
@@ -204,6 +212,7 @@ WRAPPER="${WRAPPER}"
 SERVICE_PATH="${SERVICE_PATH}"
 VERSION_FILE="${VERSION_FILE}"
 LEVEL_FILE="${LEVEL_FILE}"
+LOG_FILE="${LOG_FILE}"
 INSTALL_URL="${INSTALL_URL}"
 
 need_root() { [ "\$(id -u)" = "0" ] || { echo "需要 root：sudo \$NAME \$1" >&2; exit 1; }; }
@@ -215,7 +224,13 @@ case "\${1:-}" in
   status)   systemctl --no-pager status "\$SERVICE" ;;
   enable)   need_root enable;  systemctl enable "\$SERVICE";  echo "已设开机自启" ;;
   disable)  need_root disable; systemctl disable "\$SERVICE"; echo "已取消开机自启" ;;
-  logs)     shift; [ "\$#" -eq 0 ] && set -- -f; exec journalctl -u "\$SERVICE" "\$@" ;;
+  logs)
+    # 跟随进程自己写的日志文件（-F：文件被切走后自动跟到新文件）；额外参数原样给 tail，
+    # 如「logs -n 1000」。panic 等不走日志库的输出仍在 journalctl -u \$SERVICE。
+    shift; [ "\$#" -eq 0 ] && set -- -n 200
+    [ -f "\$LOG_FILE" ] || { echo "日志文件尚不存在：\$LOG_FILE（服务启动过吗？试试 \$NAME status）" >&2; exit 1; }
+    exec tail "\$@" -F "\$LOG_FILE"
+    ;;
   update)   need_root update;  curl -fsSL "\$INSTALL_URL" | bash -s -- --name "\$NAME" ;;
   version)
     # .version 两行：第 1 行版本号，第 2 行发布日期（旧版安装只有 1 行，日期显示 unknown）
@@ -266,7 +281,7 @@ case "\${1:-}" in
 \$NAME 管理命令：
   \$NAME start | stop | restart    启动 / 停止 / 重启服务
   \$NAME status                    查看运行状态
-  \$NAME logs [journalctl 参数]    查看日志（默认 -f 跟随；如 \$NAME logs -n 100）
+  \$NAME logs [tail 参数]          跟随日志文件 \$LOG_FILE（默认最近 200 行起；如 \$NAME logs -n 1000）
   \$NAME loglevel [级别]           查看/设置日志级别（debug|info|warn|error|fatal|off，热更新不重启）
   \$NAME enable | disable          开机自启 开 / 关
   \$NAME update                    更新到最新版并重启
@@ -290,7 +305,7 @@ systemctl --no-pager --full status "${SERVICE_NAME}" | head -n 10 || true
 echo
 echo "==> 完成。管理命令（开头为 ${NAME}）："
 echo "    ${NAME} status      查看状态"
-echo "    ${NAME} logs        看日志（-f 跟随）"
+echo "    ${NAME} logs        跟随日志（文件 ${LOG_FILE}）"
 echo "    ${NAME} loglevel    查看/设置日志级别（如 ${NAME} loglevel debug）"
 echo "    ${NAME} restart     重启"
 echo "    ${NAME} update      更新到最新版"

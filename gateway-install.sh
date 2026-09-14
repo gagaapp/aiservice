@@ -123,6 +123,8 @@ SERVICE_PATH="/etc/systemd/system/${NAME}.service"
 SYSCTL_DROPIN="/etc/sysctl.d/99-${NAME}.conf"
 VERSION_FILE="${BIN_DIR}/.version"
 LEVEL_FILE="${BIN_DIR}/loglevel"
+LOG_DIR="${BIN_DIR}/logs"                 # 日志目录；进程默认就写 <二进制目录>/logs，unit 里再显式给一遍
+LOG_FILE="${LOG_DIR}/gateway.log"         # 文件名是二进制里定死的，与 --name 无关
 CONF_DIR="/etc/${NAME}"
 ENV_FILE="${CONF_DIR}/${NAME}.env"
 NGINX_CONF="${CONF_DIR}/nginx.conf"      # 由 gateway(go) 拿到下发配置后生成
@@ -339,6 +341,8 @@ Restart=always
 RestartSec=3
 LimitNOFILE=1048576
 Environment=LOG_LEVEL_FILE=${LEVEL_FILE}
+# 日志文件目录：进程自己按天/按大小切并清理，不走 journald（见「<名称> logs」）
+Environment=LOG_DIR=${LOG_DIR}
 User=root
 
 [Install]
@@ -363,6 +367,7 @@ WRAPPER="${WRAPPER}"
 SERVICE_PATH="${SERVICE_PATH}"
 VERSION_FILE="${VERSION_FILE}"
 LEVEL_FILE="${LEVEL_FILE}"
+LOG_FILE="${LOG_FILE}"
 INSTALL_URL="${INSTALL_URL}"
 ENV_FILE="${ENV_FILE}"
 NGINX_CONF="${NGINX_CONF}"
@@ -533,7 +538,13 @@ case "\${1:-}" in
     echo "--- \$NAME ---"; systemctl is-active "\$SERVICE" 2>/dev/null || true
     echo "--- nginx 容器 ---"; docker ps -a --filter "name=^\${CONTAINER}\$"
     ;;
-  logs)     shift; [ "\$#" -eq 0 ] && set -- -f; exec journalctl -u "\$SERVICE" "\$@" ;;
+  logs)
+    # 跟随进程自己写的日志文件（-F：文件被切走后自动跟到新文件）；额外参数原样给 tail，
+    # 如「logs -n 1000」。panic 等不走日志库的输出仍在 journalctl -u \$SERVICE。
+    shift; [ "\$#" -eq 0 ] && set -- -n 200
+    [ -f "\$LOG_FILE" ] || { echo "日志文件尚不存在：\$LOG_FILE（服务启动过吗？试试 \$NAME status）" >&2; exit 1; }
+    exec tail "\$@" -F "\$LOG_FILE"
+    ;;
   restart-nginx)
     # gateway(go) 在重写 nginx.conf 后会调用它。优先热重载(不断连)，未运行则拉起。
     #
@@ -614,7 +625,7 @@ case "\${1:-}" in
                                   --cert-name / --tls-ca-file
   \$NAME start | stop | restart    启动 / 停止 / 重启 gateway
   \$NAME status                    本机配置 + 证书状态 + 两个组件的运行状态
-  \$NAME logs [journalctl 参数]    查看日志（默认 -f 跟随）
+  \$NAME logs [tail 参数]          跟随日志文件 \$LOG_FILE（默认最近 200 行起；如 \$NAME logs -n 1000）
   \$NAME loglevel [级别]           查看/设置日志级别（热更新不重启）
   \$NAME restart-nginx             重载 nginx（先校验配置；未运行则拉起）
   \$NAME nginx-start | nginx-stop | nginx-logs

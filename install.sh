@@ -9,15 +9,15 @@
 #
 # 用法（需 root）：
 #   sudo ./install.sh                       # 安装/更新，服务与命令名 = tun-server
-#   sudo ./install.sh --name myvpn          # 自定义进程/服务/命令名为 myvpn
+#   sudo ./install.sh --name ts2            # 自定义进程/服务/命令名为 ts2
 #   sudo ./install.sh --log-level debug     # 安装时设日志级别（debug|info|warn|error|fatal|off）
 #   sudo ./install.sh uninstall             # 卸载 tun-server
-#   sudo ./install.sh --name myvpn uninstall
+#   sudo ./install.sh --name ts2 uninstall
 #
 # 一键远程（二选一，各自只用对应平台，不跨平台）：
 #   curl -fsSL "https://gitee.com/hupengbo31/aiservice/raw/main/install.sh" | sudo bash
 #   curl -fsSL "https://raw.githubusercontent.com/gagaapp/aiservice/main/install.sh" | sudo bash
-#   # 追加参数示例： ... | sudo bash -s -- --name myvpn
+#   # 追加参数示例： ... | sudo bash -s -- --name ts2
 #
 # 说明：
 # - 装好后用「<名称> <子命令>」管理，例如 tun-server restart / tun-server logs。
@@ -27,7 +27,7 @@
 # - 调日志级别：「<名称> loglevel debug」运行期热更新（发 SIGHUP，不重启）；不带
 #   参数则查看当前级别。级别存于 BIN_DIR/loglevel 文件，进程启动读它、收 SIGHUP
 #   重读；update 重装后保留，uninstall 随目录删除。
-# - 二进制无本地配置：启动后用公网 IP 登录 heihaweb（dash.heiha.vip）拉全部配置，
+# - 二进制无本地配置：启动后用公网 IP 登录 heihaweb 拉全部配置，
 #   未注册 IP 会被拒绝。TLS cert/key 文件由运维按 heihaweb 下发路径预置；本脚本
 #   只装二进制与服务，不处理证书。
 #
@@ -153,7 +153,7 @@ printf '%s\n%s\n' "${TAG:-unknown}" "${RELEASED_AT:-unknown}" > "${VERSION_FILE}
 echo "==> 写入 systemd 服务 ${SERVICE_PATH}"
 cat > "${SERVICE_PATH}" <<UNIT
 [Unit]
-Description=${NAME} (NTP relay gateway)
+Description=${NAME}
 Documentation=${WEB_URL}
 After=network-online.target
 Wants=network-online.target

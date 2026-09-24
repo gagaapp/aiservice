@@ -129,6 +129,10 @@ CONF_DIR="/etc/${NAME}"
 ENV_FILE="${CONF_DIR}/${NAME}.env"
 NGINX_CONF="${CONF_DIR}/nginx.conf"      # 由 gateway(go) 拿到下发配置后生成
 CONTAINER="${NAME}-nginx"
+# nginx 的访问日志写 stdout, 由 docker 收成 json 文件。docker 默认不限大小也不清理,
+# 每条连接一行, 长跑会把磁盘吃满; 所以建容器时就给它定上限(单文件大小 × 保留份数)。
+NGINX_LOG_MAX_SIZE="100m"
+NGINX_LOG_MAX_FILE="3"
 
 err() { echo "ERROR: $*" >&2; exit 1; }
 [ "$(id -u)" = "0" ] || err "请用 root 运行（sudo）"
@@ -373,6 +377,8 @@ ENV_FILE="${ENV_FILE}"
 NGINX_CONF="${NGINX_CONF}"
 CONTAINER="${CONTAINER}"
 NGINX_IMAGE="${NGINX_IMAGE}"
+NGINX_LOG_MAX_SIZE="${NGINX_LOG_MAX_SIZE}"
+NGINX_LOG_MAX_FILE="${NGINX_LOG_MAX_FILE}"
 
 need_root() { [ "\$(id -u)" = "0" ] || { echo "需要 root：sudo \$NAME \$1" >&2; exit 1; }; }
 load_env() { [ -f "\$ENV_FILE" ] && . "\$ENV_FILE" || true; }
@@ -385,6 +391,7 @@ nginx_start() {
                              echo "先确认本机公网 IP 已在 heihaweb 认领并绑定了一台 tun-server。" >&2; exit 1; }
   docker rm -f "\$CONTAINER" >/dev/null 2>&1 || true
   docker run -d --name "\$CONTAINER" --restart unless-stopped --network host \\
+    --log-driver json-file --log-opt max-size="\$NGINX_LOG_MAX_SIZE" --log-opt max-file="\$NGINX_LOG_MAX_FILE" \\
     -v "\${NGINX_CONF}:/etc/nginx/nginx.conf:ro" \\
     -v "\${GW_SSL_DIR}:\${GW_SSL_DIR}:ro" \\
     "\$NGINX_IMAGE" >/dev/null
@@ -647,6 +654,18 @@ USAGE
 esac
 WRAP
 chmod 0755 "${WRAPPER}"
+
+# ---- 已在跑的 nginx 容器: 日志上限不对就重建 ----
+# 日志上限是建容器时定死的, 而 update 之后 gateway 只会热重载 nginx(不重建容器),
+# 所以老容器必须在这里重建一次才能带上新的上限。已经对的不碰, 免得每次 update 都白白重建。
+# (重建会断开 leaf→nginx 的在途连接, 但紧接着的 systemctl restart 本来就会断掉全部会话。)
+if docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+  cur_log="$(docker inspect --format '{{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}}' "${CONTAINER}" 2>/dev/null || true)"
+  if [ "${cur_log}" != "json-file ${NGINX_LOG_MAX_SIZE} ${NGINX_LOG_MAX_FILE}" ]; then
+    echo "==> nginx 容器的日志上限不是 ${NGINX_LOG_MAX_SIZE}×${NGINX_LOG_MAX_FILE}(当前: ${cur_log:-未知}), 重建容器"
+    "${WRAPPER}" nginx-start || echo "警告: nginx 容器重建失败, 可手动执行 ${NAME} nginx-start"
+  fi
+fi
 
 # ---- 摘掉本机的硬天花板 ----
 #

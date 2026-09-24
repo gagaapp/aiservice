@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
 #
-# install.sh — 在境内服务器上安装/更新/卸载 gateway（境内中转节点）。
+# install.sh — 安装/更新/卸载 gateway。
 #
 # 与 tun-server 的 install.sh 同构：从发布仓库（gitee 与 github 完全镜像）拉取与
 # 本机架构匹配的最新二进制，注册 systemd 服务，并安装一个同名管理命令。差别在于
 # gateway 还要管一个 nginx 容器，以及三个只属于这台机器的参数。
-#
-# 形态：
-#   leaf ─境内─► nginx(终 TLS_A) ─loopback+proxy_protocol─► gateway(go)
-#                                                             │ 每会话一条 TLS_B
-#                                                             ▼  跨境
-#                                                       tun-server(中继态)
 #
 # 用法（需 root）：
 #   sudo ./install.sh                                  # 安装/更新，默认端口 443/8443
@@ -21,7 +15,7 @@
 #   sudo ./install.sh --tls-ca-file /etc/ssl/ca.pem    # 私有 CA（staging/自签环境必给）
 #   sudo ./install.sh --name gw2                       # 自定义服务/命令名
 #   sudo ./install.sh --no-docker-install              # 不自动装 docker（自己管）
-#   sudo ./install.sh --no-mirror                      # 不配置境内镜像加速
+#   sudo ./install.sh --no-mirror                      # 不配置镜像加速
 #   sudo ./install.sh --log-level debug
 #   sudo ./install.sh uninstall
 #
@@ -31,14 +25,13 @@
 #   # 追加参数示例： ... | sudo bash -s -- --listen-port 8443
 #
 # 说明：
-# - 绑定哪台 tun-server、出境 SNI、transport、预热连接下限都**不在这里配**——gateway
-#   启动后按本机公网 IP 向 heihaweb 认领，配置全部由控制面下发。未授权的 IP 会被
-#   一直拒绝、永不进入服务态。
+# - 运行参数全部由 heihaweb 下发，不在这里配；本机公网 IP 需先在 heihaweb 认领，
+#   未认领的 IP 会被一直拒绝。
 # - 这里只配这台机器的物理属性：端口、证书目录。TLS_A 私钥永远不进控制面。
-# - 证书必须是真实域名 + 受信任 CA 签发；自签是明显可疑信号。本脚本不申请、不续期。
+# - 证书需由受信任 CA 签发。本脚本不申请、不续期。
 # - docker 缺失会自动安装（nginx 以容器运行）。已装 docker 的机器一律不碰其配置；
 #   只有「本脚本刚装的 docker」且机器上还没有 /etc/docker/daemon.json 时，才会写一份
-#   镜像加速配置——境内直连 Docker Hub 基本拉不动。用 --no-docker-install /
+#   镜像加速配置——直连 Docker Hub 可能很慢或不通。用 --no-docker-install /
 #   --no-mirror 可分别关掉这两件事。
 #
 set -euo pipefail
@@ -79,7 +72,7 @@ SSL_DIR=""
 CERT_NAME=""
 TLS_CA_FILE=""
 NO_DOCKER_INSTALL=0     # 自己管 docker 的运维可以关掉自动安装
-NO_MIRROR=0             # 关掉境内镜像加速（境外机器或已有自定义配置时）
+NO_MIRROR=0             # 关掉镜像加速（不需要加速或已有自定义配置时）
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -168,7 +161,7 @@ ensure_docker() {
   [ "${NO_DOCKER_INSTALL}" = "1" ] && err "未安装 docker，且指定了 --no-docker-install"
 
   echo "==> 未检测到 docker，开始安装"
-  # 官方便捷脚本；gateway 按定义装在境内，默认走阿里云镜像，否则大概率卡死。
+  # 官方便捷脚本；默认走阿里云镜像，否则大概率卡死。
   # --mirror 只影响下载 docker 自身的软件源，与后面拉 nginx 镜像是两回事。
   local args=""
   [ "${NO_MIRROR}" = "1" ] || args="--mirror Aliyun"
@@ -184,7 +177,7 @@ ensure_docker() {
   echo "    已安装 $(docker --version 2>/dev/null | head -1)"
 
   # 只在「我们刚装的 docker」且「还没有 daemon.json」时配镜像加速：
-  # 境内直连 Docker Hub 基本拉不动。绝不覆盖运维已有的配置。
+  # 直连 Docker Hub 可能很慢或不通。绝不覆盖运维已有的配置。
   if [ "${NO_MIRROR}" != "1" ] && [ ! -f /etc/docker/daemon.json ]; then
     echo "    配置镜像加速（/etc/docker/daemon.json）"
     mkdir -p /etc/docker
@@ -254,7 +247,7 @@ printf '%s\n%s\n' "${TAG:-unknown}" "${RELEASED_AT:-unknown}" > "${VERSION_FILE}
 
 # ---- 拉 nginx 镜像 ----
 #
-# 境内直连 Docker Hub 基本拉不动, 而且 `docker pull` **没有超时**, 会一直挂着 ——
+# 直连 Docker Hub 可能很慢或不通, 而且 `docker pull` **没有超时**, 会一直挂着 ——
 # 这是最容易让人以为"装死了"的地方。这里的策略:
 #
 #   1. 本地已有该镜像 → 直接用, 不联网。
@@ -277,13 +270,13 @@ pull_nginx() {
     return 0
   fi
 
-  # 只给直连 20s: 通的话远快于此; 不通的话(境内常态)不该每次装都白等一分钟。
+  # 只给直连 20s: 通的话远快于此; 不通的话不该每次装都白等一分钟。
   echo "    直连 Docker Hub（最多等 20s）…"
   if run_timeout 20 docker pull "${NGINX_IMAGE}" >/dev/null 2>&1; then
     echo "    拉取成功"
     return 0
   fi
-  echo "    直连超时或失败，改用境内镜像站"
+  echo "    直连超时或失败，改用镜像站"
 
   # nginx 是官方镜像, 在镜像站上的路径是 <mirror>/library/nginx:<tag>
   local repo="${NGINX_IMAGE%%:*}" tag="${NGINX_IMAGE##*:}" m src
@@ -312,7 +305,7 @@ pull_nginx
 echo "==> 写入本机配置 ${ENV_FILE}"
 cat > "${ENV_FILE}" <<ENV
 # 由 install.sh 生成。这些是本机的物理属性，不由 heihaweb 下发。
-# 绑定的 tun-server / SNI / transport / 预热连接下限全部来自控制面。
+# 其余参数全部来自 heihaweb。
 GW_LISTEN_PORT=${LISTEN_PORT}
 GW_LOOPBACK_PORT=${LOOPBACK_PORT}
 GW_SSL_DIR=${SSL_DIR}
@@ -332,7 +325,7 @@ ENV
 echo "==> 写入 systemd 服务 ${SERVICE_PATH}"
 cat > "${SERVICE_PATH}" <<UNIT
 [Unit]
-Description=${NAME} (domestic relay for tun-server)
+Description=${NAME}
 Documentation=${WEB_URL}
 After=network-online.target docker.service
 Wants=network-online.target
@@ -404,7 +397,7 @@ write_env() {
   local tmp; tmp="\$(mktemp)"
   cat > "\$tmp" <<ENV
 # 由 \$NAME set / install.sh 生成。这些是本机的物理属性, 不由 heihaweb 下发。
-# 绑定的 tun-server / SNI / transport / 预热连接下限全部来自控制面。
+# 其余参数全部来自 heihaweb。
 GW_LISTEN_PORT=\${GW_LISTEN_PORT}
 GW_LOOPBACK_PORT=\${GW_LOOPBACK_PORT}
 GW_SSL_DIR=\${GW_SSL_DIR}
@@ -426,7 +419,7 @@ print_conf() {
   fi
   [ -n "\${GW_TLS_CA_FILE:-}" ] && echo "TLS_B 信任锚          : \${GW_TLS_CA_FILE}" || true
   echo
-  echo "绑定的 tun-server、出境 SNI、transport、预热连接下限由 heihaweb 下发, 不在本机配。"
+  echo "其余运行参数由 heihaweb 下发, 不在本机配。"
 }
 
 # gw_menu 是交互式菜单。它只是把下面那些子命令包一层 —— 所有动作仍走同一条路径,
@@ -640,7 +633,7 @@ case "\${1:-}" in
   \$NAME version                   显示已安装版本与发布日期
   \$NAME uninstall                 卸载
 
-绑定哪台 tun-server、出境 SNI、transport、预热连接下限都由 heihaweb 下发，
+其余运行参数都由 heihaweb 下发，
 本机只管端口与证书（用 \$NAME set 改，重装时不写的参数沿用旧值）。
 USAGE
     ;;
@@ -655,10 +648,7 @@ esac
 WRAP
 chmod 0755 "${WRAPPER}"
 
-# ---- 已在跑的 nginx 容器: 日志上限不对就重建 ----
-# 日志上限是建容器时定死的, 而 update 之后 gateway 只会热重载 nginx(不重建容器),
-# 所以老容器必须在这里重建一次才能带上新的上限。已经对的不碰, 免得每次 update 都白白重建。
-# (重建会断开 leaf→nginx 的在途连接, 但紧接着的 systemctl restart 本来就会断掉全部会话。)
+
 if docker inspect "${CONTAINER}" >/dev/null 2>&1; then
   cur_log="$(docker inspect --format '{{.HostConfig.LogConfig.Type}} {{index .HostConfig.LogConfig.Config "max-size"}} {{index .HostConfig.LogConfig.Config "max-file"}}' "${CONTAINER}" 2>/dev/null || true)"
   if [ "${cur_log}" != "json-file ${NGINX_LOG_MAX_SIZE} ${NGINX_LOG_MAX_FILE}" ]; then
@@ -669,8 +659,8 @@ fi
 
 # ---- 摘掉本机的硬天花板 ----
 #
-# 数据面是 1:1 的: 每个用户会话占一条跨境 TCP 连接。默认的 sysctl 会在几万连接上
-# 先撞墙, 而撞墙表现为 connect() 返回 EADDRNOTAVAIL —— 一个很难查的报错。
+# 每条出向连接占用一个本机源端口。默认的 sysctl 会在几万连接上先触到上限,
+# 表现为 connect() 返回 EADDRNOTAVAIL —— 一个很难查的报错。
 # 下面两项都是**摘天花板**, 不是限流:
 #
 #   * ip_local_port_range: 出向源端口数从默认约 2.8w 提到约 6.4w。
@@ -686,7 +676,7 @@ cat >"${SYSCTL_DROPIN}" <<'SYSCTL'
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_tw_reuse = 1
 SYSCTL
-sysctl --system >/dev/null 2>&1 || echo "警告: sysctl 应用失败, 高并发下可能提前撞到端口上限"
+sysctl --system >/dev/null 2>&1 || echo "警告: sysctl 应用失败, 高并发下可能提前触到端口上限"
 
 # ---- 启用并启动 ----
 echo "==> 启用并启动服务"
@@ -703,7 +693,7 @@ echo "    对外端口 ${LISTEN_PORT}   loopback ${LOOPBACK_PORT}   证书 ${SSL
 echo
 echo "接下来："
 echo "    1) 把真实域名的证书放到 ${SSL_DIR}/${CERT_NAME}.crt 与 .key"
-echo "       必须受信任 CA 签发——自签是明显可疑信号。"
+echo "       必须由受信任 CA 签发。"
 echo "    2) 在 heihaweb 后台认领本机公网 IP，并绑定一台 tun-server。"
 echo "    3) ${NAME} restart-nginx     # 配置下发后拉起 nginx"
 echo

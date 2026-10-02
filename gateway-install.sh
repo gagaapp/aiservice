@@ -28,6 +28,9 @@
 # - 运行参数全部由 heihaweb 下发，不在这里配；本机公网 IP 需先在 heihaweb 认领，
 #   未认领的 IP 会被一直拒绝。
 # - 这里只配这台机器的物理属性：端口、证书目录。TLS_A 私钥永远不进控制面。
+# - 访问 heihaweb 用哪个本机 IP：装好后用「<名称> bindip <IP>」绑定、「<名称> bindip off」
+#   取消（与 tun-server 同一个命令）。机器有多个 IP、或同时有 IPv4 和 IPv6 时，不绑定的话
+#   heihaweb 认到的 IP 可能来回换。值和端口一起存在 env 文件里，重装时沿用。
 # - 证书需由受信任 CA 签发。本脚本不申请、不续期。
 # - docker 缺失会自动安装（nginx 以容器运行）。已装 docker 的机器一律不碰其配置；
 #   只有「本脚本刚装的 docker」且机器上还没有 /etc/docker/daemon.json 时，才会写一份
@@ -311,6 +314,8 @@ GW_LOOPBACK_PORT=${LOOPBACK_PORT}
 GW_SSL_DIR=${SSL_DIR}
 GW_CERT_NAME=${CERT_NAME}
 GW_TLS_CA_FILE=${TLS_CA_FILE}
+# 访问 heihaweb 用的本机 IP，空 = 系统自动选择（用「${NAME} bindip」改）
+CONTROL_BIND_IP=${CONTROL_BIND_IP:-}
 ENV
 
 # ---- 写 systemd unit ----
@@ -372,6 +377,7 @@ CONTAINER="${CONTAINER}"
 NGINX_IMAGE="${NGINX_IMAGE}"
 NGINX_LOG_MAX_SIZE="${NGINX_LOG_MAX_SIZE}"
 NGINX_LOG_MAX_FILE="${NGINX_LOG_MAX_FILE}"
+CONTROL_BIND_IP=""   # 只认 env 文件里的值（load_env 读进来）, 不让调用者 shell 里的同名变量混进来
 
 need_root() { [ "\$(id -u)" = "0" ] || { echo "需要 root：sudo \$NAME \$1" >&2; exit 1; }; }
 load_env() { [ -f "\$ENV_FILE" ] && . "\$ENV_FILE" || true; }
@@ -403,8 +409,53 @@ GW_LOOPBACK_PORT=\${GW_LOOPBACK_PORT}
 GW_SSL_DIR=\${GW_SSL_DIR}
 GW_CERT_NAME=\${GW_CERT_NAME}
 GW_TLS_CA_FILE=\${GW_TLS_CA_FILE}
+# 访问 heihaweb 用的本机 IP，空 = 系统自动选择（用「\$NAME bindip」改）
+CONTROL_BIND_IP=\${CONTROL_BIND_IP:-}
 ENV
   mv "\$tmp" "\$ENV_FILE"
+}
+
+# ---- 访问 heihaweb 用的本机 IP（CONTROL_BIND_IP）----
+# 和端口一起存在 ENV_FILE，systemd 经 EnvironmentFile 读给进程；进程只在启动时读，改了要重启。
+
+# bind_ip_line 打印配置里的绑定（print_conf 用它，所以 show/status/菜单都有）。调用前先 load_env。
+# env 文件被 write_env 写成 0600 后非 root 读不到，这时如实说读不到，不能当成"未绑定"。
+bind_ip_line() {
+  if [ -f "\$ENV_FILE" ] && [ ! -r "\$ENV_FILE" ]; then
+    echo "连 heihaweb 的本机 IP : ?（读不到配置，需要 root）"
+  else
+    echo "连 heihaweb 的本机 IP : \${CONTROL_BIND_IP:-未绑定（系统自动选择）}"
+  fi
+}
+
+# check_bind_ip 确认 \$1 是本机网卡上的 IP，再从它出去测网络通不通（访问 Cloudflare，heihaweb
+# 就在它后面；只测网络，不管 heihaweb 放不放行）。通过时设 BIND_IP（ip 命令给出的写法）和
+# SEEN（Cloudflare 看到的来源 IP，也就是 heihaweb 会看到的 IP）；不通过时写明原因、返回 1。
+check_bind_ip() {
+  local out trace why rc=0 fam=-4
+  case "\$1" in */*) echo "「\$1」不是单个 IP 地址" >&2; return 1 ;; esac
+  command -v ip >/dev/null 2>&1 || { echo "没有 ip 命令（iproute2），确认不了 \$1 是不是本机的 IP" >&2; return 1; }
+  out="\$(ip -o addr show to "\$1" 2>/dev/null)" || { echo "「\$1」不是合法的 IP 地址" >&2; return 1; }
+  BIND_IP="\$(printf '%s\n' "\$out" | awk '{print \$4}' | cut -d/ -f1 | head -n 1)"
+  if [ -z "\$BIND_IP" ]; then
+    echo "本机网卡上没有 \$1。本机现有的 IP：" >&2
+    ip -o addr show scope global 2>/dev/null | awk '{print "  " \$4}' | cut -d/ -f1 >&2
+    return 1
+  fi
+  case "\$BIND_IP" in *:*) fam=-6 ;; esac
+  trace="\$(curl -s "\$fam" --noproxy '*' --max-time 10 --interface "\$BIND_IP" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)" || rc=\$?
+  SEEN="\$(printf '%s\n' "\$trace" | sed -n 's/^ip=//p')"
+  if [ "\$rc" = 0 ] && [ -n "\$SEEN" ]; then return 0; fi
+  case "\$rc" in
+    45) why="用不了这个 IP 发起连接" ;;
+    6)  why="解析不了 www.cloudflare.com（本机 DNS 有问题）" ;;
+    7)  why="连不上（被拒绝或网络不可达）" ;;
+    28) why="10 秒内没连上（超时）" ;;
+    0)  why="返回内容里没有来源 IP" ;;
+    *)  why="curl 退出码 \$rc" ;;
+  esac
+  echo "从 \$BIND_IP 访问外网不通：\$why。没有修改配置。" >&2
+  return 1
 }
 
 print_conf() {
@@ -418,6 +469,7 @@ print_conf() {
     echo "                        **缺失** —— 必须是真实域名 + 受信任 CA 签发"
   fi
   [ -n "\${GW_TLS_CA_FILE:-}" ] && echo "TLS_B 信任锚          : \${GW_TLS_CA_FILE}" || true
+  bind_ip_line
   echo
   echo "其余运行参数由 heihaweb 下发, 不在本机配。"
 }
@@ -438,6 +490,7 @@ gw_menu() {
     echo " 10) 查看 nginx 日志"
     echo " 11) 日志级别      12) 版本"
     echo " 13) 更新到最新版  14) 卸载"
+    echo " 15) 连 heihaweb 的本机 IP（查看 / 绑定 / 取消）"
     echo "  0) 退出"
     printf "请选择: "
     read -r choice || return 0
@@ -458,6 +511,9 @@ gw_menu() {
       13) "\$WRAPPER" update ;;
       14) printf "确认卸载 \$NAME? 输入 yes 继续: "; read -r c
           [ "\$c" = "yes" ] && { "\$WRAPPER" uninstall; exit 0; } || echo "已取消" ;;
+      # 输错 IP 时 bindip 会报错退出; || true 让菜单留在原地, 而不是整个退出
+      15) printf "本机 IP（留空 = 只查看，off = 取消绑定）: "; read -r bip
+          if [ -n "\$bip" ]; then "\$WRAPPER" bindip "\$bip" || true; else "\$WRAPPER" bindip; fi ;;
       0|q|Q) return 0 ;;
       *) echo "无效选择" ;;
     esac
@@ -595,6 +651,28 @@ case "\${1:-}" in
       echo "日志级别已写入 \$LEVEL（\$NAME 未运行，下次启动生效）"
     fi
     ;;
+  bindip)
+    # 访问 heihaweb 用哪个本机 IP（与 tun-server 的同名命令一致）。不带参数 = 查看；带 IP = 先确认
+    # 它在本机、网络通，再写配置并重启；off = 取消。进程只在启动时读它，所以改动会重启 gateway。
+    shift
+    load_env
+    if [ "\$#" -eq 0 ]; then bind_ip_line; exit 0; fi
+    need_root bindip
+    if [ "\$1" = "off" ]; then
+      CONTROL_BIND_IP=""
+      write_env
+      systemctl restart "\$SERVICE"
+      echo "已取消绑定并重启 \$NAME：连 heihaweb 改由系统自动选择本机 IP"
+      exit 0
+    fi
+    check_bind_ip "\$1" || exit 1
+    CONTROL_BIND_IP="\$BIND_IP"
+    write_env
+    systemctl restart "\$SERVICE"
+    echo "已绑定并重启 \$NAME"
+    echo "  绑定的本机 IP       ：\$BIND_IP"
+    echo "  heihaweb 会看到的 IP：\$SEEN   ← 在 heihaweb 后台按这个 IP 认领"
+    ;;
   uninstall)
     need_root uninstall
     systemctl stop "\$SERVICE" 2>/dev/null || true
@@ -627,6 +705,7 @@ case "\${1:-}" in
   \$NAME status                    本机配置 + 证书状态 + 两个组件的运行状态
   \$NAME logs [tail 参数]          跟随日志文件 \$LOG_FILE（默认最近 200 行起；如 \$NAME logs -n 1000）
   \$NAME loglevel [级别]           查看/设置日志级别（热更新不重启）
+  \$NAME bindip [IP|off]           查看 / 绑定 / 取消 连 heihaweb 用的本机 IP（改动会重启 gateway）
   \$NAME restart-nginx             重载 nginx（先校验配置；未运行则拉起）
   \$NAME nginx-start | nginx-stop | nginx-logs
   \$NAME update                    更新到最新版并重启
@@ -697,6 +776,6 @@ echo "       必须由受信任 CA 签发。"
 echo "    2) 在 heihaweb 后台认领本机公网 IP，并绑定一台 tun-server。"
 echo "    3) ${NAME} restart-nginx     # 配置下发后拉起 nginx"
 echo
-echo "管理命令：${NAME} show / set / status / logs / restart-nginx / update / uninstall"
+echo "管理命令：${NAME} show / set / bindip / status / logs / restart-nginx / update / uninstall"
 echo "改端口或证书目录：${NAME} set --listen-port 8443   （只改配置+重启，不重新下载）"
 echo "提示：未在 heihaweb 认领的公网 IP 会被一直拒绝，gateway 不会进入服务态。"

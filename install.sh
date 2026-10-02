@@ -27,6 +27,11 @@
 # - 调日志级别：「<名称> loglevel debug」运行期热更新（发 SIGHUP，不重启）；不带
 #   参数则查看当前级别。级别存于 BIN_DIR/loglevel 文件，进程启动读它、收 SIGHUP
 #   重读；update 重装后保留，uninstall 随目录删除。
+# - 访问 heihaweb 用哪个本机 IP：「<名称> bindip <IP>」绑定，「<名称> bindip off」取消，
+#   「<名称> bindip」查看（「<名称> status」第一行也会显示）。机器有多个 IP、或同时有
+#   IPv4 和 IPv6 时，不绑定的话 heihaweb 认到的 IP 可能来回换。值存在
+#   BIN_DIR/<名称>.env，systemd 经 EnvironmentFile 读给进程；update 重装后保留，
+#   uninstall 随目录删除。
 # - 二进制无本地配置：启动后用公网 IP 登录 heihaweb 拉全部配置，
 #   未注册 IP 会被拒绝。TLS cert/key 文件由运维按 heihaweb 下发路径预置；本脚本
 #   只装二进制与服务，不处理证书。
@@ -92,6 +97,8 @@ LEVEL_FILE="${BIN_DIR}/loglevel"          # 日志级别文件；unit 用 LOG_LE
 LOG_DIR="${BIN_DIR}/logs"                 # 日志目录；进程默认就写 <二进制目录>/logs，
                                           # unit 里再显式给一遍，避免二进制路径变了对不上
 LOG_FILE="${LOG_DIR}/tun-server.log"      # 文件名是二进制里定死的，与 --name 无关
+ENV_FILE="${BIN_DIR}/${NAME}.env"         # 本机设置（目前只有 CONTROL_BIND_IP，见「<名称> bindip」）；
+                                          # 放在 BIN_DIR：update 重装不碰它，uninstall 随目录删除
 
 err() { echo "ERROR: $*" >&2; exit 1; }
 [ "$(id -u)" = "0" ] || err "请用 root 运行（sudo）"
@@ -168,6 +175,8 @@ LimitNOFILE=1048576
 Environment=LOG_LEVEL_FILE=${LEVEL_FILE}
 # 日志文件目录：进程自己按天/按大小切并清理，不走 journald（见「<名称> logs」）
 Environment=LOG_DIR=${LOG_DIR}
+# 本机设置（访问 heihaweb 用的本机 IP，见「<名称> bindip」）。前缀 - ：文件不存在也照常启动
+EnvironmentFile=-${ENV_FILE}
 # 监听 :443 需特权端口，且需读取 heihaweb 下发路径的 cert/key
 User=root
 
@@ -214,14 +223,71 @@ VERSION_FILE="${VERSION_FILE}"
 LEVEL_FILE="${LEVEL_FILE}"
 LOG_FILE="${LOG_FILE}"
 INSTALL_URL="${INSTALL_URL}"
+ENV_FILE="${ENV_FILE}"
 
 need_root() { [ "\$(id -u)" = "0" ] || { echo "需要 root：sudo \$NAME \$1" >&2; exit 1; }; }
+
+# ---- 访问 heihaweb 用的本机 IP（CONTROL_BIND_IP）----
+# 值存在 ENV_FILE，systemd 经 EnvironmentFile 读给进程；进程只在启动时读，改了要重启。
+
+# show_bind_ip 打印配置里的绑定（status 第一行、不带参数的 bindip 都用它）。
+show_bind_ip() {
+  local cfg=""
+  if [ -f "\$ENV_FILE" ]; then cfg="\$(sed -n 's/^CONTROL_BIND_IP=//p' "\$ENV_FILE" | tail -n 1)"; fi
+  echo "连 heihaweb 的本机 IP：\${cfg:-未绑定（系统自动选择）}"
+}
+
+# set_bind_ip 写入（\$1 为空则删除）ENV_FILE 里的 CONTROL_BIND_IP，其余行原样保留。
+# 先写同目录的临时文件再改名：中途失败不会留下写了一半的配置。
+set_bind_ip() {
+  local tmp
+  mkdir -p "\$(dirname "\$ENV_FILE")"
+  tmp="\$(mktemp "\$ENV_FILE.XXXXXX")"
+  if [ -f "\$ENV_FILE" ]; then
+    grep -v '^CONTROL_BIND_IP=' "\$ENV_FILE" > "\$tmp" || true
+  else
+    echo "# \$NAME 本机设置（由「\$NAME bindip」维护；systemd 经 EnvironmentFile 读给进程）" > "\$tmp"
+  fi
+  if [ -n "\$1" ]; then printf 'CONTROL_BIND_IP=%s\n' "\$1" >> "\$tmp"; fi
+  chmod 0644 "\$tmp"
+  mv -f "\$tmp" "\$ENV_FILE"
+}
+
+# check_bind_ip 确认 \$1 是本机网卡上的 IP，再从它出去测网络通不通（访问 Cloudflare，heihaweb
+# 就在它后面；只测网络，不管 heihaweb 放不放行）。通过时设 BIND_IP（ip 命令给出的写法）和
+# SEEN（Cloudflare 看到的来源 IP，也就是 heihaweb 会看到的 IP）；不通过时写明原因、返回 1。
+check_bind_ip() {
+  local out trace why rc=0 fam=-4
+  case "\$1" in */*) echo "「\$1」不是单个 IP 地址" >&2; return 1 ;; esac
+  command -v ip >/dev/null 2>&1 || { echo "没有 ip 命令（iproute2），确认不了 \$1 是不是本机的 IP" >&2; return 1; }
+  out="\$(ip -o addr show to "\$1" 2>/dev/null)" || { echo "「\$1」不是合法的 IP 地址" >&2; return 1; }
+  BIND_IP="\$(printf '%s\n' "\$out" | awk '{print \$4}' | cut -d/ -f1 | head -n 1)"
+  if [ -z "\$BIND_IP" ]; then
+    echo "本机网卡上没有 \$1。本机现有的 IP：" >&2
+    ip -o addr show scope global 2>/dev/null | awk '{print "  " \$4}' | cut -d/ -f1 >&2
+    return 1
+  fi
+  case "\$BIND_IP" in *:*) fam=-6 ;; esac
+  trace="\$(curl -s "\$fam" --noproxy '*' --max-time 10 --interface "\$BIND_IP" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)" || rc=\$?
+  SEEN="\$(printf '%s\n' "\$trace" | sed -n 's/^ip=//p')"
+  if [ "\$rc" = 0 ] && [ -n "\$SEEN" ]; then return 0; fi
+  case "\$rc" in
+    45) why="用不了这个 IP 发起连接" ;;
+    6)  why="解析不了 www.cloudflare.com（本机 DNS 有问题）" ;;
+    7)  why="连不上（被拒绝或网络不可达）" ;;
+    28) why="10 秒内没连上（超时）" ;;
+    0)  why="返回内容里没有来源 IP" ;;
+    *)  why="curl 退出码 \$rc" ;;
+  esac
+  echo "从 \$BIND_IP 访问外网不通：\$why。没有修改配置。" >&2
+  return 1
+}
 
 case "\${1:-}" in
   start)    need_root start;   systemctl start "\$SERVICE" ;;
   stop)     need_root stop;    systemctl stop "\$SERVICE" ;;
   restart)  need_root restart; systemctl restart "\$SERVICE" ;;
-  status)   systemctl --no-pager status "\$SERVICE" ;;
+  status)   show_bind_ip; echo; systemctl --no-pager status "\$SERVICE" ;;
   enable)   need_root enable;  systemctl enable "\$SERVICE";  echo "已设开机自启" ;;
   disable)  need_root disable; systemctl disable "\$SERVICE"; echo "已取消开机自启" ;;
   logs)
@@ -266,6 +332,25 @@ case "\${1:-}" in
       echo "日志级别已写入 \$LEVEL（\$NAME 未运行，下次启动生效）"
     fi
     ;;
+  bindip)
+    # 访问 heihaweb 用哪个本机 IP。不带参数 = 查看；带 IP = 先确认它在本机、网络通，再写配置并重启；
+    # off = 取消。进程只在启动时读它，所以改动会重启服务（正在连接的用户会断开一次）。
+    shift
+    if [ "\$#" -eq 0 ]; then show_bind_ip; exit 0; fi
+    need_root bindip
+    if [ "\$1" = "off" ]; then
+      set_bind_ip ""
+      systemctl restart "\$SERVICE"
+      echo "已取消绑定并重启 \$NAME：连 heihaweb 改由系统自动选择本机 IP"
+      exit 0
+    fi
+    check_bind_ip "\$1" || exit 1
+    set_bind_ip "\$BIND_IP"
+    systemctl restart "\$SERVICE"
+    echo "已绑定并重启 \$NAME"
+    echo "  绑定的本机 IP       ：\$BIND_IP"
+    echo "  heihaweb 会看到的 IP：\$SEEN   ← 在 heihaweb 后台按这个 IP 登记"
+    ;;
   uninstall)
     need_root uninstall
     systemctl stop "\$SERVICE" 2>/dev/null || true
@@ -283,6 +368,7 @@ case "\${1:-}" in
   \$NAME status                    查看运行状态
   \$NAME logs [tail 参数]          跟随日志文件 \$LOG_FILE（默认最近 200 行起；如 \$NAME logs -n 1000）
   \$NAME loglevel [级别]           查看/设置日志级别（debug|info|warn|error|fatal|off，热更新不重启）
+  \$NAME bindip [IP|off]           查看 / 绑定 / 取消 连 heihaweb 用的本机 IP（改动会重启服务）
   \$NAME enable | disable          开机自启 开 / 关
   \$NAME update                    更新到最新版并重启
   \$NAME version                   显示已安装版本与发布日期
@@ -307,6 +393,7 @@ echo "==> 完成。管理命令（开头为 ${NAME}）："
 echo "    ${NAME} status      查看状态"
 echo "    ${NAME} logs        跟随日志（文件 ${LOG_FILE}）"
 echo "    ${NAME} loglevel    查看/设置日志级别（如 ${NAME} loglevel debug）"
+echo "    ${NAME} bindip      查看/绑定连 heihaweb 用的本机 IP（如 ${NAME} bindip 1.2.3.4）"
 echo "    ${NAME} restart     重启"
 echo "    ${NAME} update      更新到最新版"
 echo "    ${NAME} uninstall   卸载"
